@@ -8,7 +8,8 @@ For all non-archived projects in GitLab:
   - Outputs a CSV report
 
 Usage:
-    python gitlab_image_report.py
+    python gitlab_image_report.py                  # default 10 threads
+    python gitlab_image_report.py --threads 20     # custom thread count
 
 Requirements:
     pip install python-gitlab
@@ -19,13 +20,16 @@ import csv
 import sys
 import time
 import logging
+import argparse
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gitlab
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GITLAB_URL   = "https://gitlab.example.com"
-TOKEN        = "your_private_token"
+GITLAB_URL    = "https://gitlab.example.com"
+TOKEN         = "your_private_token"
 BRANCH_PREFIX = "feature/"
 JOB_KEYWORDS  = ["build", "test", "publish"]   # order matters for matching priority
 OUTPUT_FILE   = f"gitlab_image_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -35,11 +39,14 @@ MAX_PIPELINES_TO_SCAN = 100
 
 # Delay between trace fetches to avoid hammering the API (seconds)
 TRACE_FETCH_DELAY = 0.2
+
+# Default number of parallel threads
+DEFAULT_THREADS = 10
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
@@ -141,7 +148,66 @@ def fetch_job_images(project, pipeline) -> dict:
     return images
 
 
+def process_project(project, counter: dict, lock: threading.Lock) -> dict | None:
+    """
+    Process a single project: find latest feature/* pipeline, extract job images.
+    Returns a report row dict, or None if the project should be skipped.
+    Thread-safe — each call is fully independent.
+    """
+    with lock:
+        counter["total"] += 1
+        idx = counter["total"]
+
+    log.info(f"[{idx}] {project.name_with_namespace}")
+
+    pipeline = get_latest_feature_pipeline(project)
+    if not pipeline:
+        log.info(f"  ↳ [{project.name}] No feature/* pipeline found — skipping")
+        with lock:
+            counter["skipped"] += 1
+        return None
+
+    log.info(
+        f"  ↳ [{project.name}] Pipeline #{pipeline.id}  "
+        f"branch={pipeline.ref}  status={pipeline.status}"
+    )
+
+    images = fetch_job_images(project, pipeline)
+
+    log.info(
+        f"  ↳ [{project.name}] "
+        f"build={images['build']} | "
+        f"test={images['test']} | "
+        f"publish={images['publish']}"
+    )
+
+    return {
+        "project_name":    project.name_with_namespace,
+        "project_url":     project.web_url,
+        "branch":          pipeline.ref,
+        "pipeline_id":     pipeline.id,
+        "pipeline_status": pipeline.status,
+        "build_image":     images["build"],
+        "test_image":      images["test"],
+        "publish_image":   images["publish"],
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="GitLab Pipeline Image Report")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=DEFAULT_THREADS,
+        help=f"Number of parallel threads (default: {DEFAULT_THREADS})"
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    num_threads = args.threads
+
     log.info(f"Connecting to {GITLAB_URL}")
     gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN)
 
@@ -153,42 +219,31 @@ def main():
         sys.exit(1)
 
     log.info("Fetching all non-archived projects...")
-    projects = gl.projects.list(archived=False, iterator=True, per_page=100)
+    all_projects = list(gl.projects.list(archived=False, iterator=True, per_page=100))
+    log.info(f"Found {len(all_projects)} projects — processing with {num_threads} threads")
 
     report_rows = []
-    total = 0
-    skipped = 0
+    counter = {"total": 0, "skipped": 0}
+    lock = threading.Lock()
 
-    for project in projects:
-        total += 1
-        log.info(f"[{total}] {project.name_with_namespace}")
+    with ThreadPoolExecutor(max_workers=num_threads, thread_name_prefix="worker") as executor:
+        futures = {
+            executor.submit(process_project, project, counter, lock): project
+            for project in all_projects
+        }
 
-        pipeline = get_latest_feature_pipeline(project)
-        if not pipeline:
-            log.info(f"  ↳ No feature/* pipeline found — skipping")
-            skipped += 1
-            continue
+        for future in as_completed(futures):
+            project = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    with lock:
+                        report_rows.append(result)
+            except Exception as e:
+                log.error(f"Unhandled error for project {project.name_with_namespace}: {e}")
 
-        log.info(f"  ↳ Pipeline #{pipeline.id}  branch={pipeline.ref}  status={pipeline.status}")
-
-        images = fetch_job_images(project, pipeline)
-
-        report_rows.append({
-            "project_url":   project.web_url,
-            "project_name":  project.name_with_namespace,
-            "branch":        pipeline.ref,
-            "pipeline_id":   pipeline.id,
-            "pipeline_status": pipeline.status,
-            "build_image":   images["build"],
-            "test_image":    images["test"],
-            "publish_image": images["publish"],
-        })
-
-        log.info(
-            f"  ↳ build={images['build']} | "
-            f"test={images['test']} | "
-            f"publish={images['publish']}"
-        )
+    # ── Sort report by project name for consistent output ─────────────────────
+    report_rows.sort(key=lambda r: r["project_name"].lower())
 
     # ── Write CSV ─────────────────────────────────────────────────────────────
     fieldnames = [
@@ -209,10 +264,11 @@ def main():
 
     log.info("")
     log.info("=" * 60)
-    log.info(f"Report saved to  : {OUTPUT_FILE}")
-    log.info(f"Total projects   : {total}")
-    log.info(f"With feature/*   : {len(report_rows)}")
-    log.info(f"Skipped (no match): {skipped}")
+    log.info(f"Report saved to   : {OUTPUT_FILE}")
+    log.info(f"Threads used      : {num_threads}")
+    log.info(f"Total projects    : {counter['total']}")
+    log.info(f"With feature/*    : {len(report_rows)}")
+    log.info(f"Skipped (no match): {counter['skipped']}")
     log.info("=" * 60)
 
 
