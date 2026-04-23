@@ -1,305 +1,220 @@
 """
-GitLab Pipeline Image Reporter
-================================
-For every project in a GitLab instance, finds the most recent pipeline
-triggered from a feature/* branch, then reports the Docker image used
-by jobs whose names contain 'build', 'test', or 'publish'.
+GitLab Pipeline Image Report
+----------------------------
+For all non-archived projects in GitLab:
+  - Finds the latest pipeline triggered from a feature/* branch
+  - Looks for jobs containing: build, test, publish (in job name)
+  - Extracts the Docker image used by parsing job trace logs
+  - Outputs a CSV report
 
-Projects are processed concurrently using a thread pool. Each thread
-owns its own GitLab client (python-gitlab's requests.Session is not
-thread-safe when shared across threads).
-
-Output: console table + pipeline_image_report.csv
+Usage:
+    python gitlab_image_report.py
 
 Requirements:
-    pip install python-gitlab tabulate
-
-Environment variables (required):
-    GITLAB_URL    - e.g. https://gitlab.example.com
-    GITLAB_TOKEN  - personal/project access token with read_api scope
+    pip install python-gitlab
 """
 
-import os
+import re
 import csv
 import sys
+import time
 import logging
-import threading
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
 import gitlab
-from tabulate import tabulate
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+GITLAB_URL   = "https://gitlab.example.com"
+TOKEN        = "your_private_token"
+BRANCH_PREFIX = "feature/"
+JOB_KEYWORDS  = ["build", "test", "publish"]   # order matters for matching priority
+OUTPUT_FILE   = f"gitlab_image_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-GITLAB_URL   = os.environ.get("GITLAB_URL", "https://gitlab.com")
-GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+# How many pipelines to scan per project before giving up on finding a feature/* one
+MAX_PIPELINES_TO_SCAN = 100
 
-# Number of projects processed in parallel
-THREAD_COUNT = 10
-
-# How many recent pipelines to scan per project when looking for feature/* ones
-PIPELINE_SCAN_LIMIT = 100
-
-# Job name keywords → report column  (case-insensitive substring match)
-JOB_CATEGORIES = {
-    "build":   "build_image",
-    "test":    "test_image",
-    "publish": "publish_image",
-}
-
-OUTPUT_CSV = "pipeline_image_report.csv"
-
-# ── Logging ───────────────────────────────────────────────────────────────────
+# Delay between trace fetches to avoid hammering the API (seconds)
+TRACE_FETCH_DELAY = 0.2
+# ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 
-# ── Thread-local GitLab client ────────────────────────────────────────────────
-# Each worker thread gets its own gitlab.Gitlab instance so HTTP sessions
-# are never shared across threads.
 
-_thread_local = threading.local()
-
-
-def get_thread_gl() -> gitlab.Gitlab:
-    """Return (or lazily create) the per-thread GitLab client."""
-    if not hasattr(_thread_local, "gl"):
-        _thread_local.gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
-    return _thread_local.gl
+IMAGE_RE = re.compile(
+    r"Using Docker executor with image\s+(.+?)\s*\.\.\.",
+    re.IGNORECASE
+)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def extract_image_from_trace(trace: str) -> str:
+    """Parse docker image name from GitLab runner trace log."""
+    match = IMAGE_RE.search(trace)
+    return match.group(1).strip() if match else None
 
-def get_image_name(job_detail) -> str:
+
+def get_latest_feature_pipeline(project):
     """
-    Extract the Docker image name from a fully-fetched job object.
-    The 'image' attribute may be:
-        - a dict  → {"name": "python:3.11", "entrypoint": [...]}
-        - a str   → "python:3.11"
-        - missing → job inherits from pipeline-level image (not exposed via API)
+    Scan recent pipelines for this project and return the most recent one
+    whose ref starts with 'feature/'. Returns None if not found.
     """
-    raw = getattr(job_detail, "image", None)
-    if not raw:
-        return "inherited / not set"
-    if isinstance(raw, dict):
-        return raw.get("name", str(raw))
-    return str(raw)
-
-
-def classify_job(job_name: str) -> Optional[str]:
-    """Return the category key if the job name matches a keyword, else None."""
-    lower = job_name.lower()
-    for keyword in JOB_CATEGORIES:
-        if keyword in lower:
-            return keyword
+    try:
+        count = 0
+        for pl in project.pipelines.list(
+            iterator=True,
+            per_page=50,
+            order_by="id",
+            sort="desc"
+        ):
+            if pl.ref and pl.ref.startswith(BRANCH_PREFIX):
+                return pl
+            count += 1
+            if count >= MAX_PIPELINES_TO_SCAN:
+                break
+    except gitlab.exceptions.GitlabListError as e:
+        log.warning(f"  Could not list pipelines: {e}")
     return None
 
 
-# ── Progress counter (thread-safe) ────────────────────────────────────────────
-
-class _Counter:
-    """Simple thread-safe integer counter."""
-    def __init__(self):
-        self._lock  = threading.Lock()
-        self._value = 0
-
-    def increment(self) -> int:
-        with self._lock:
-            self._value += 1
-            return self._value
-
-    @property
-    def value(self) -> int:
-        with self._lock:
-            return self._value
+def get_matched_keyword(job_name: str) -> str | None:
+    """Return the first matching keyword found in a job name, or None."""
+    name_lower = job_name.lower()
+    for kw in JOB_KEYWORDS:
+        if kw in name_lower:
+            return kw
+    return None
 
 
-# ── Core logic ────────────────────────────────────────────────────────────────
-
-def process_project(project_id: int, counter: _Counter, total: int) -> Optional[dict]:
+def fetch_job_images(project, pipeline) -> dict:
     """
-    Worker function — runs inside a thread-pool thread.
-
-    Uses the thread-local GitLab client so each thread has its own
-    HTTP session (python-gitlab / requests is not thread-safe when shared).
-
-    Returns a report row dict, or None if no matching feature/* pipeline
-    or relevant jobs were found for this project.
+    For a given pipeline, iterate jobs and extract images for
+    build/test/publish jobs by parsing their trace logs.
+    Returns dict: { "build": "<image>", "test": "<image>", "publish": "<image>" }
     """
-    gl           = get_thread_gl()
-    done         = counter.increment()
-    project_name = f"id={project_id}"           # fallback label before fetch
+    images = {kw: None for kw in JOB_KEYWORDS}
 
     try:
-        project      = gl.projects.get(project_id)
-        project_name = project.path_with_namespace
-    except gitlab.exceptions.GitlabGetError as exc:
-        log.warning("[%d/%d] Cannot fetch project %s: %s", done, total, project_id, exc)
-        return None
+        # Get the full pipeline object (list returns lazy objects)
+        full_pipeline = project.pipelines.get(pipeline.id)
+        jobs = full_pipeline.jobs.list(all=True)
+    except gitlab.exceptions.GitlabGetError as e:
+        log.warning(f"  Could not fetch pipeline jobs: {e}")
+        return images
 
-    log.info("[%d/%d] Processing: %s", done, total, project_name)
-
-    # ── Step 1: find the most recent pipeline on a feature/* branch ──────────
-    latest_feature_pipeline = None
-    try:
-        for pipeline in project.pipelines.list(
-            per_page=PIPELINE_SCAN_LIMIT,
-            order_by="id",
-            sort="desc",
-            iterator=False,
-        ):
-            ref = getattr(pipeline, "ref", "") or ""
-            if ref.startswith("feature/"):
-                latest_feature_pipeline = pipeline
-                break
-    except gitlab.exceptions.GitlabListError as exc:
-        log.warning("  ↳ Cannot list pipelines for %s: %s", project_name, exc)
-        return None
-
-    if not latest_feature_pipeline:
-        log.debug("  ↳ No feature/* pipeline found — skipping %s", project_name)
-        return None
-
-    pipeline_ref = latest_feature_pipeline.ref
-    pipeline_id  = latest_feature_pipeline.id
-    log.info("  ↳ Found pipeline #%s on ref=%s", pipeline_id, pipeline_ref)
-
-    # ── Step 2: collect jobs matching build / test / publish ─────────────────
-    row = {
-        "project_url":   project.web_url,
-        "project_name":  project_name,
-        "branch":        pipeline_ref,
-        "pipeline_id":   pipeline_id,
-        "build_image":   "",
-        "test_image":    "",
-        "publish_image": "",
-    }
-
-    matched_any = False
-    try:
-        pipeline_jobs = latest_feature_pipeline.jobs.list(all=True)
-    except gitlab.exceptions.GitlabListError as exc:
-        log.warning("  ↳ Cannot list jobs: %s", exc)
-        return None
-
-    for job in pipeline_jobs:
-        category = classify_job(job.name)
-        if category is None:
+    for job in jobs:
+        keyword = get_matched_keyword(job.name)
+        if not keyword:
             continue
 
-        col = JOB_CATEGORIES[category]
-        if row[col]:            # already filled by an earlier matching job
+        # Skip if we already captured an image for this keyword
+        if images[keyword] is not None:
+            log.debug(f"  Skipping {job.name} — already have image for '{keyword}'")
             continue
 
-        # Full job detail required — the pipeline job list doesn't include 'image'
+        log.info(f"  Fetching trace for job: [{keyword}] {job.name} (id={job.id})")
+
         try:
-            job_detail = project.jobs.get(job.id)
-            image_name = get_image_name(job_detail)
-        except gitlab.exceptions.GitlabGetError as exc:
-            log.warning("    ↳ Cannot fetch job %s (%s): %s", job.id, job.name, exc)
-            image_name = "error fetching"
+            raw_trace = project.jobs.get(job.id).trace()
+            trace_text = (
+                raw_trace.decode("utf-8", errors="ignore")
+                if isinstance(raw_trace, bytes)
+                else raw_trace
+            )
+            image = extract_image_from_trace(trace_text)
+            images[keyword] = image if image else "shell/custom runner"
+            time.sleep(TRACE_FETCH_DELAY)
 
-        log.info(
-            "    job %-30s  category=%-8s  image=%s",
-            job.name, category, image_name,
-        )
-        row[col]    = image_name
-        matched_any = True
+        except gitlab.exceptions.GitlabGetError as e:
+            log.warning(f"  Could not fetch trace for job {job.name}: {e}")
+            images[keyword] = "trace fetch error"
 
-    return row if matched_any else None
+    # Fill missing keywords with N/A
+    for kw in JOB_KEYWORDS:
+        if images[kw] is None:
+            images[kw] = "N/A"
+
+    return images
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+def main():
+    log.info(f"Connecting to {GITLAB_URL}")
+    gl = gitlab.Gitlab(GITLAB_URL, private_token=TOKEN)
 
-def run():
-    if not GITLAB_TOKEN:
-        log.error("GITLAB_TOKEN environment variable is not set. Exiting.")
-        sys.exit(1)
-
-    # Auth check via a dedicated client (main thread only)
-    log.info("Connecting to GitLab: %s", GITLAB_URL)
-    gl_main = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
     try:
-        gl_main.auth()
-        log.info("Authenticated as: %s", gl_main.users.get_current().username)
-    except Exception as exc:
-        log.error("Authentication failed: %s", exc)
+        gl.auth()
+        log.info(f"Authenticated as: {gl.users.get_current().username}")
+    except Exception as e:
+        log.error(f"Authentication failed: {e}")
         sys.exit(1)
 
-    # Collect all project IDs first (iterator keeps the main-thread session tidy)
-    log.info("Fetching project list …")
-    try:
-        project_ids = [p.id for p in gl_main.projects.list(all=True, iterator=True)]
-    except gitlab.exceptions.GitlabListError as exc:
-        log.error("Failed to list projects: %s", exc)
-        sys.exit(1)
+    log.info("Fetching all non-archived projects...")
+    projects = gl.projects.list(archived=False, iterator=True, per_page=100)
 
-    total = len(project_ids)
-    log.info("Total projects found: %d  |  Thread pool size: %d", total, THREAD_COUNT)
-
-    # ── Thread pool ───────────────────────────────────────────────────────────
-    counter = _Counter()
-    report  : list[dict] = []
+    report_rows = []
+    total = 0
     skipped = 0
 
-    with ThreadPoolExecutor(max_workers=THREAD_COUNT, thread_name_prefix="gl-worker") as pool:
-        # Submit all project IDs at once; the pool caps concurrency at THREAD_COUNT
-        futures = {
-            pool.submit(process_project, pid, counter, total): pid
-            for pid in project_ids
-        }
+    for project in projects:
+        total += 1
+        log.info(f"[{total}] {project.name_with_namespace}")
 
-        for future in as_completed(futures):
-            pid = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    report.append(result)
-                else:
-                    skipped += 1
-            except Exception as exc:
-                log.error("Unhandled error for project id=%s: %s", pid, exc)
-                skipped += 1
+        pipeline = get_latest_feature_pipeline(project)
+        if not pipeline:
+            log.info(f"  ↳ No feature/* pipeline found — skipping")
+            skipped += 1
+            continue
 
-    # ── Output ────────────────────────────────────────────────────────────────
-    if not report:
-        log.warning("No matching projects found.")
-        return
+        log.info(f"  ↳ Pipeline #{pipeline.id}  branch={pipeline.ref}  status={pipeline.status}")
 
-    # Sort by project name for a stable, readable output
-    report.sort(key=lambda r: r["project_name"])
+        images = fetch_job_images(project, pipeline)
 
-    table_cols = [
-        ("Project URL",    "project_url"),
-        ("Branch",         "branch"),
-        ("Pipeline ID",    "pipeline_id"),
-        ("Build Image",    "build_image"),
-        ("Test Image",     "test_image"),
-        ("Publish Image",  "publish_image"),
+        report_rows.append({
+            "project_url":   project.web_url,
+            "project_name":  project.name_with_namespace,
+            "branch":        pipeline.ref,
+            "pipeline_id":   pipeline.id,
+            "pipeline_status": pipeline.status,
+            "build_image":   images["build"],
+            "test_image":    images["test"],
+            "publish_image": images["publish"],
+        })
+
+        log.info(
+            f"  ↳ build={images['build']} | "
+            f"test={images['test']} | "
+            f"publish={images['publish']}"
+        )
+
+    # ── Write CSV ─────────────────────────────────────────────────────────────
+    fieldnames = [
+        "project_name",
+        "project_url",
+        "branch",
+        "pipeline_id",
+        "pipeline_status",
+        "build_image",
+        "test_image",
+        "publish_image",
     ]
 
-    table_data = [[row[k] for _, k in table_cols] for row in report]
-    headers    = [h for h, _ in table_cols]
-
-    print("\n" + tabulate(table_data, headers=headers, tablefmt="rounded_outline"))
-    print(f"\n  Total projects   : {total}")
-    print(f"  Matched projects : {len(report)}")
-    print(f"  Skipped projects : {skipped}")
-    print(f"  Thread pool size : {THREAD_COUNT}")
-
-    # CSV
-    csv_fields = [k for _, k in table_cols]
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=csv_fields, extrasaction="ignore")
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(report)
+        writer.writerows(report_rows)
 
-    log.info("CSV saved → %s", OUTPUT_CSV)
+    log.info("")
+    log.info("=" * 60)
+    log.info(f"Report saved to  : {OUTPUT_FILE}")
+    log.info(f"Total projects   : {total}")
+    log.info(f"With feature/*   : {len(report_rows)}")
+    log.info(f"Skipped (no match): {skipped}")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
-    run()
+    main()
